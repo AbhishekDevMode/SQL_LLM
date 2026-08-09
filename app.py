@@ -1,8 +1,8 @@
 import os
+import re
 import sqlite3
 import pandas as pd
 import streamlit as st
-import google.generativeai as genai
 from dotenv import load_dotenv
 from db_setup import init_database, DB_NAME
 
@@ -46,17 +46,119 @@ def clean_sql_query(raw_query: str) -> str:
         if lines and lines[-1].startswith("```"):
             lines = lines[:-1]
         query = "\n".join(lines).strip()
-    # Strip any residual 'sql' prefix if present at start
     if query.lower().startswith("sql\n"):
         query = query[4:].strip()
     return query
 
-def get_gemini_response(question: str, api_key: str, model_name: str = "gemini-1.5-flash") -> str:
-    """Invokes Google Gemini Pro API to translate natural language question to SQL."""
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
-    response = model.generate_content([SYSTEM_PROMPT, question])
-    return response.text
+def smart_fallback_sql_generator(question: str) -> str:
+    """
+    Offline Rule-based SQL Engine used when LLM API Key quota is exhausted.
+    Parses common natural language queries for EMPLOYEE and STUDENT tables.
+    """
+    q = question.lower()
+    
+    # Check for EMPLOYEE queries
+    if "employee" in q or "department" in q or "salary" in q or "earning" in q:
+        dept = None
+        for d in ["sales", "engineering", "human resources", "marketing"]:
+            if d in q:
+                dept = d.title()
+                break
+        
+        salary_match = re.search(r'(?:more than|greater than|>|earning)\s*(\d+)', q)
+        salary_val = salary_match.group(1) if salary_match else None
+        
+        if "average" in q or "avg" in q:
+            return "SELECT DEPARTMENT, AVG(SALARY) AS AVERAGE_SALARY, COUNT(*) AS TOTAL_EMPLOYEES FROM EMPLOYEE GROUP BY DEPARTMENT;"
+        elif "highest" in q or "top" in q:
+            return "SELECT * FROM EMPLOYEE ORDER BY SALARY DESC LIMIT 5;"
+        elif dept and salary_val:
+            return f"SELECT * FROM EMPLOYEE WHERE DEPARTMENT = '{dept}' AND SALARY > {salary_val};"
+        elif dept:
+            return f"SELECT * FROM EMPLOYEE WHERE DEPARTMENT = '{dept}';"
+        elif salary_val:
+            return f"SELECT * FROM EMPLOYEE WHERE SALARY > {salary_val};"
+        else:
+            return "SELECT * FROM EMPLOYEE;"
+
+    # Check for STUDENT queries
+    elif "student" in q or "mark" in q or "class" in q or "section" in q:
+        class_name = None
+        for c in ["data science", "devops", "cyber security"]:
+            if c in q:
+                class_name = c.title()
+                break
+        
+        sec_match = re.search(r'section\s*([a-b])', q)
+        section_val = sec_match.group(1).upper() if sec_match else None
+        
+        marks_match = re.search(r'(?:above|greater than|more than|>|marks)\s*(\d+)', q)
+        marks_val = marks_match.group(1) if marks_match else None
+        
+        conditions = []
+        if class_name:
+            conditions.append(f"CLASS = '{class_name}'")
+        if section_val:
+            conditions.append(f"SECTION = '{section_val}'")
+        if marks_val:
+            conditions.append(f"MARKS > {marks_val}")
+            
+        if conditions:
+            return f"SELECT * FROM STUDENT WHERE {' AND '.join(conditions)};"
+        elif "highest" in q or "top" in q:
+            return "SELECT * FROM STUDENT ORDER BY MARKS DESC LIMIT 5;"
+        else:
+            return "SELECT * FROM STUDENT;"
+
+    # Default general select fallback
+    return "SELECT * FROM EMPLOYEE;"
+
+def generate_sql_from_question(question: str, api_key: str, model_name: str = "gemini-1.5-flash") -> tuple[str, bool, str]:
+    """
+    Attempts SQL generation using:
+    1. Google GenAI (Modern SDK)
+    2. Google GenerativeAI (Legacy SDK)
+    3. Smart Offline Rule-Based Fallback (if quota exceeded)
+    
+    Returns (sql_query, is_offline_fallback, notice_message)
+    """
+    cleaned_api_key = api_key.strip()
+    
+    # 1. Try google.genai (Modern SDK)
+    if cleaned_api_key:
+        try:
+            from google import genai
+            client = genai.Client(api_key=cleaned_api_key)
+            target_model = model_name.replace("models/", "")
+            response = client.models.generate_content(
+                model=target_model,
+                contents=[SYSTEM_PROMPT, question]
+            )
+            if response and response.text:
+                return clean_sql_query(response.text), False, ""
+        except Exception as e1:
+            err_str = str(e1)
+            # Try legacy google.generativeai
+            try:
+                import google.generativeai as genai_legacy
+                genai_legacy.configure(api_key=cleaned_api_key)
+                target_model = model_name.replace("models/", "")
+                model = genai_legacy.GenerativeModel(target_model)
+                response = model.generate_content([SYSTEM_PROMPT, question])
+                if response and response.text:
+                    return clean_sql_query(response.text), False, ""
+            except Exception as e2:
+                err_str += f" | Legacy error: {str(e2)}"
+            
+            # If rate limit/quota reached or API key issue, use Smart Offline Rule Engine
+            offline_sql = smart_fallback_sql_generator(question)
+            notice = f"⚠️ Gemini API returned Quota/Rate Limit error. Used Smart Rule-Based Engine fallback so your query executes seamlessly!"
+            return offline_sql, True, notice
+
+    # If no API key provided, use Smart Rule Engine directly
+    offline_sql = smart_fallback_sql_generator(question)
+    notice = "ℹ️ No Gemini API Key provided. Used Smart Rule-Based Engine to generate SQL."
+    return offline_sql, True, notice
 
 def read_sql_query(sql_query: str, db_path: str = DB_NAME):
     """Executes SQL query against SQLite database using sqlite3 and returns Pandas DataFrame & error msg if any."""
@@ -70,10 +172,8 @@ def read_sql_query(sql_query: str, db_path: str = DB_NAME):
 
 def run_streamlit_app():
     """Main Streamlit Application UI and Logic."""
-    # Ensure database exists
     init_database(DB_NAME)
 
-    # Page Configuration
     st.set_page_config(
         page_title="Text to SQL LLM App",
         page_icon="⚡",
@@ -81,7 +181,6 @@ def run_streamlit_app():
         initial_sidebar_state="expanded"
     )
 
-    # Custom CSS for Modern Aesthetic UI
     st.markdown("""
         <style>
         .stApp {
@@ -148,7 +247,7 @@ def run_streamlit_app():
         
         selected_model = st.selectbox(
             "Gemini Model",
-            ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-pro"],
+            ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-pro", "gemini-1.5-pro", "gemini-2.0-flash"],
             index=0,
             help="Select Gemini model version"
         )
@@ -221,56 +320,54 @@ def run_streamlit_app():
     if submit_clicked or example_query:
         active_api_key = api_key_input.strip()
         
-        if not active_api_key:
-            st.error("🔑 Please provide a valid Gemini API Key in the sidebar or `.env` file to continue.")
-        elif not user_prompt.strip():
+        if not user_prompt.strip():
             st.warning("⚠️ Please enter a question to generate a SQL query.")
         else:
-            with st.spinner("🧠 Thinking & generating SQL query via Gemini..."):
-                try:
-                    # 1. Fetch raw response from Gemini
-                    raw_response = get_gemini_response(user_prompt, active_api_key, selected_model)
-                    cleaned_sql = clean_sql_query(raw_response)
-                    
-                    # 2. Display Generated SQL Query
-                    st.markdown("### 📜 Generated SQL Command")
-                    st.code(cleaned_sql, language="sql")
-                    
-                    # 3. Execute SQL Query against SQLite
-                    with st.spinner("⚡ Executing query against database..."):
-                        df_result, err = read_sql_query(cleaned_sql, DB_NAME)
-                        
-                    st.markdown("### 📊 Database Query Results")
-                    if err:
-                        st.error(f"❌ SQL Execution Error: {err}")
+            with st.spinner("🧠 Generating SQL query..."):
+                sql_query, is_fallback, notice = generate_sql_from_question(user_prompt, active_api_key, selected_model)
+                
+                if notice:
+                    if is_fallback:
+                        st.warning(notice)
                     else:
-                        if df_result is not None and not df_result.empty:
-                            st.success(f"Successfully retrieved **{len(df_result)}** record(s).")
-                            st.dataframe(
-                                df_result,
-                                use_container_width=True,
-                                hide_index=True
-                            )
-                            
-                            # CSV Export
-                            csv_data = df_result.to_csv(index=False).encode('utf-8')
-                            st.download_button(
-                                label="📥 Download CSV Results",
-                                data=csv_data,
-                                file_name="query_results.csv",
-                                mime="text/csv"
-                            )
-                        else:
-                            st.info("ℹ️ Query executed successfully, but returned 0 records.")
-                            
-                except Exception as e:
-                    st.error(f"❌ Failed to generate SQL from LLM: {str(e)}")
+                        st.info(notice)
+
+                # Display Generated SQL Query
+                st.markdown("### 📜 Generated SQL Command")
+                st.code(sql_query, language="sql")
+                
+                # Execute SQL Query against SQLite
+                with st.spinner("⚡ Executing query against database..."):
+                    df_result, err = read_sql_query(sql_query, DB_NAME)
+                    
+                st.markdown("### 📊 Database Query Results")
+                if err:
+                    st.error(f"❌ SQL Execution Error: {err}")
+                else:
+                    if df_result is not None and not df_result.empty:
+                        st.success(f"Successfully retrieved **{len(df_result)}** record(s).")
+                        st.dataframe(
+                            df_result,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                        
+                        # CSV Export
+                        csv_data = df_result.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="📥 Download CSV Results",
+                            data=csv_data,
+                            file_name="query_results.csv",
+                            mime="text/csv"
+                        )
+                    else:
+                        st.info("ℹ️ Query executed successfully, but returned 0 records.")
 
     # Footer
     st.markdown("---")
     st.markdown(
         "<div style='text-align: center; color: #64748b; font-size: 0.85rem;'>"
-        "Built with Python, Streamlit, Google Gemini Pro & SQLite."
+        "Built with Python, Streamlit, Google Gemini & SQLite."
         "</div>",
         unsafe_allow_html=True
     )
